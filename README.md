@@ -15,21 +15,23 @@ response on the way out.
 ```text
 ctx      := { req: Request, state: State, ... }   -- explicit record,
                                              -- threaded, no cells
-next     := (ctx) ~> { resp, state }             -- the rest of the chain
-mw       := (ctx, next) ~> { resp, state }       -- a middleware
-terminal := (ctx) ~> resp | { resp, state }      -- LAST step; the router
+next     := (ctx) ~> { out, state }               -- the rest of the chain
+mw       := (ctx, next) ~> { out, state }         -- a middleware
+terminal := (ctx) ~> resp | { out, state }        -- LAST step; the router
 ```
 
 State merges **right-wins**: a middleware passes state inward with
 `hash_map.merge(ctx.state, additions)` (its keys win over what it
-received) and returns the outward state in the `{ resp, state }` pair.
-Returning a bare response record is allowed — it normalizes to
-`{ resp, state: <incoming ctx.state> }`.
+received) and returns the outward state in the `{ out, state }` pair.
+Returning a bare response record is allowed — lib-route normalizes it
+to `{ out, state: <incoming ctx.state> }`.
 
+`pipeline`/`chain`/`end`/`state_get`/`state_put` are delegated to
+**lib-route** (`route` package) and re-exported here.
 `chain([mw1, mw2, ..., terminal])` folds right-to-left into one
 serve-ready `(req) ~> resp` — `serve(chain([...]), { port })` works
 directly. `pipeline(steps)` exposes the same fold as
-`(ctx) ~> { resp, state }` for callers that want to seed state or keep
+`(ctx) ~> { out, state }` for callers that want to seed state or keep
 the outward state. `end(h)` adapts a `(req) ~> resp` handler (e.g.
 `http-route`'s `router(routes)` output) into a `(ctx) ~> resp`
 terminal.

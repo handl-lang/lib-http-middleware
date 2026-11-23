@@ -9,13 +9,13 @@
 --- (auth 401, CORS preflight, body-limit 413), or post-process the
 --- response on the way out.
 ---
---- Protocol (proposal-0007):
+--- Protocol (proposal-0007, pair convention from lib-route):
 ---
 ---   ctx      := { req: Request, state: State, ... }   -- explicit record,
 ---                                                  -- threaded, no cells
----   next     := (ctx) ~> { resp, state }             -- the rest of chain
----   mw       := (ctx, next) ~> { resp, state }       -- a middleware
----   terminal := (ctx) ~> resp | { resp, state }      -- LAST step of chain;
+---   next     := (ctx) ~> { out, state }             -- the rest of chain
+---   mw       := (ctx, next) ~> { out, state }       -- a middleware
+---   terminal := (ctx) ~> resp | { out, state }      -- LAST step of chain;
 ---                                                  -- usually the router
 ---                                                  -- (wrap a `(req) ~> resp`
 ---                                                  -- handler with `end/1`)
@@ -23,16 +23,19 @@
 --- State merges right-wins: a middleware passes state inward with
 --- `hash_map.merge(ctx.state, additions)` (its own keys win over what it
 --- received) and returns the state it wants propagated outward in the
---- `{ resp, state }` pair. Returning a bare response record is allowed —
---- it is normalized to `{ resp, state: <incoming ctx.state> }`.
+--- `{ out, state }` pair. Returning a bare response record is allowed —
+--- lib-route normalizes it to `{ out, state: <incoming ctx.state> }`.
 ---
---- `chain([mw1, mw2, ..., terminal])` folds right-to-left into one
---- serve-ready `(req) ~> resp`: it seeds `ctx = { req, state: {} }`, so
---- `serve(chain([...]), { port })` works directly. `pipeline(steps)` is
---- the same fold exposed as `(ctx) ~> { resp, state }` for callers that
---- want to seed state or keep the outward state.
+--- `pipeline`/`chain`/`end`/`state_get`/`state_put` are DELEGATED to
+--- lib-route (`route` package) — this module only re-exports them so
+--- existing consumers keep working. `chain([mw1, mw2, ..., terminal])`
+--- folds right-to-left into one serve-ready `(req) ~> resp`: it seeds
+--- `ctx = { req, state: {} }`, so `serve(chain([...]), { port })`
+--- works directly. `pipeline(steps)` is the same fold exposed as
+--- `(ctx) ~> { out, state }` for callers that want to seed state or
+--- keep the outward state.
 ---
---- v1 middleware (each a factory returning `(ctx, next) ~> { resp, state }`):
+--- v1 middleware (each a factory returning `(ctx, next) ~> { out, state }`):
 ---   cors(opts)        Access-Control-* headers; OPTIONS preflight
 ---                      short-circuits 204 before routing.
 ---   logger(log, opts?)  method/path/status/duration -> lib-log emit port.
@@ -49,11 +52,11 @@
 --- upgrade, streaming bodies.
 ---
 --- Exports:
----   chain(steps)        ~> (req) ~> resp          -- serve-ready
----   pipeline(steps)     ~> (ctx) ~> { resp, state }
----   end(h)              ~> (ctx) ~> resp          -- adapt `(req) ~> resp`
----   state_get(ctx,k)    ~> value | null           -- ctx.state lookup
----   state_put(ctx,k,v)  ~> new ctx               -- ctx.state write helper
+---   chain(steps)        ~> (req) ~> resp          -- serve-ready (lib-route)
+---   pipeline(steps)     ~> (ctx) ~> { out, state } -- (lib-route)
+---   end(h)              ~> (ctx) ~> resp          -- adapt `(req) ~> resp` (lib-route)
+---   state_get(ctx,k)    ~> value | null           -- ctx.state lookup (lib-route)
+---   state_put(ctx,k,v)  ~> new ctx               -- ctx.state write helper (lib-route)
 ---   cors(opts)          ~> middleware
 ---   logger(log, opts?)  ~> middleware
 ---   request_id(opts)    ~> middleware
@@ -66,6 +69,18 @@
 ---   body_limit(n)       ~> middleware
 
 from "str" import * as str
+from "route" import * as rt
+
+-- ---------------------------------------------------------------------
+-- pipeline core — delegated to lib-route (P-008 clean break); re-exported
+-- here so existing `http-middleware` consumers keep working unchanged.
+-- ---------------------------------------------------------------------
+
+export pipeline := rt.pipeline
+export chain := rt.chain
+export end := rt.end
+export state_get := rt.state_get
+export state_put := rt.state_put
 
 -- ---------------------------------------------------------------------
 -- small helpers (same shapes as http-route's private ones)
@@ -89,15 +104,7 @@ mem := (x, xs) ~> while { xs: xs, found: false } {
   }
 }
 
-revlist := (xs) ~> while { xs: xs, out: [] } {
-  (xs, out) ~> match xs {
-    []: { out: out },
-    [h, ...t]: { state: { xs: t, out: [h, ...out] } }
-  }
-}
-
 is_obj    := (v) ~> type.of(v) == "object"
-is_arr    := (v) ~> type.of(v) == "array"
 is_str    := (v) ~> type.of(v) == "string"
 is_arrow  := (v) ~> type.of(v) == "arrow"
 
@@ -119,20 +126,8 @@ rest0 := (rest) ~> match rest {
 }
 
 -- ---------------------------------------------------------------------
--- { resp, state } pair plumbing
+-- response-header helpers (operate on the response record itself)
 -- ---------------------------------------------------------------------
-
---- normalize any step result to the `{ resp, state }` pair. A record
---- carrying a `resp` key is already a pair (missing `state` falls back
---- to the ctx the step saw); anything else is a bare response.
-as_pair := (r, ctx) ~> do {
-  if is_obj(r) && hash_map.has(r, "resp") {
-    { resp: hash_map.get_or(r, "resp", null),
-      state: hash_map.get_or(r, "state", state_of(ctx)) }
-  } else {
-    { resp: r, state: state_of(ctx) }
-  }
-}
 
 --- set one response header (lowercase name by convention — the wire
 --- codec emits header record keys verbatim).
@@ -159,83 +154,6 @@ with_headers := (resp, pairs) ~> do {
     hash_map.merge(resp, { headers: put_hs(hs, pairs) })
   }
 }
-
--- ---------------------------------------------------------------------
--- ctx.state accessors (exported for handlers/middleware authors)
--- ---------------------------------------------------------------------
-
-export state_get := (ctx, k) ~> hash_map.get_or(state_of(ctx), k, null)
-
---- returns a NEW ctx with `k -> v` merged into state (right-wins: v
---- overrides any existing `k`).
-export state_put := (ctx, k, v) ~> do {
-  hash_map.merge(ctx, { state: hash_map.set(state_of(ctx), k, v) })
-}
-
--- ---------------------------------------------------------------------
--- pipeline / chain
--- ---------------------------------------------------------------------
-
---- validate every step is an arrow.
-all_arrows := (xs) ~> while { xs: xs, ok: true } {
-  (xs, ok) ~> match xs {
-    []: { out: ok },
-    [h, ...t]: if is_arrow(h) {
-      { state: { xs: t, ok: ok } }
-    } else {
-      { out: false }
-    }
-  }
-}
-
---- fold `steps` right-to-left into `(ctx) ~> { resp, state }`.
---- steps = [mw..., terminal]; every element but the last is a
---- middleware `(ctx, next) ~> { resp, state }`; the last is the
---- terminal `(ctx) ~> resp | { resp, state }`.
-export pipeline := (steps) ~> do {
-  if is_arr(steps) == false || alen(steps) == 0 {
-    error.raise("http-middleware: pipeline needs a non-empty list of steps")
-  } else {
-    if all_arrows(steps) == false {
-      error.raise("http-middleware: every pipeline step must be an arrow")
-    } else {
-      do {
-        rs := revlist(steps)              -- [terminal, mwN, ..., mw1]
-        term := rs[0]
-        termn := (ctx) ~> as_pair(term(ctx), ctx)
-        mids := match rs {
-          [_t, ...t]: t,
-          []: []
-        }
-        acc := while { xs: mids, acc: termn } {
-          (xs, acc) ~> match xs {
-            []: { out: acc },
-            [mw, ...t]: do {
-              nxt := acc
-              { state: { xs: t,
-                acc: (ctx) ~> as_pair(mw(ctx, nxt), ctx) } }
-            }
-          }
-        }
-        acc
-      }
-    }
-  }
-}
-
---- serve-ready handler: `serve(chain([mw..., router_or_end]), { port })`.
---- Seeds `ctx = { req, state: {} }` and returns the final `resp`.
-export chain := (steps) ~> do {
-  p := pipeline(steps)
-  (req) ~> do {
-    r := p({ req: req, state: {} })
-    r.resp
-  }
-}
-
---- adapt a `(req) ~> resp` handler (e.g. `http-route`'s `router(routes)`
---- output) into a `(ctx) ~> resp` terminal for `pipeline`/`chain`.
-export end := (h) ~> (ctx) ~> h(req_of(ctx))
 
 -- ---------------------------------------------------------------------
 -- cors
@@ -298,13 +216,13 @@ export cors := (opts) ~> do {
       } else {
         [...ps, ["access-control-max-age", str_of(max_age)]]
       }
-      { resp: { status: 204,
+      { out: { status: 204,
                headers: put_hs({}, ps2),
                body: "" },
         state: state_of(ctx) }
     } else {
       r := next(ctx)
-      { resp: with_headers(r.resp, actual_pairs(req)),
+      { out: with_headers(r.out, actual_pairs(req)),
         state: r.state }
     }
   }
@@ -340,7 +258,7 @@ export logger := (lg, ...rest) ~> do {
   (ctx, next) ~> do {
     t0 := nowf()
     r := next(ctx)
-    resp := hash_map.get_or(r, "resp", {})
+    resp := hash_map.get_or(r, "out", {})
     req := req_of(ctx)
     attrs := {
       method: hash_map.get_or(req, "method", ""),
@@ -354,7 +272,7 @@ export logger := (lg, ...rest) ~> do {
       msgf
     }
     emit(lg, lvl, msg, attrs)
-    { resp: r.resp, state: r.state }
+    { out: r.out, state: r.state }
   }
 }
 
@@ -393,7 +311,7 @@ export request_id := (opts) ~> do {
     ctx2 := hash_map.merge(ctx, {
       state: hash_map.set(state_of(ctx), key, rid) })
     r := next(ctx2)
-    { resp: set_header(r.resp, hn, rid), state: r.state }
+    { out: set_header(r.out, hn, rid), state: r.state }
   }
 }
 
@@ -435,7 +353,7 @@ cookie_get := (hdr, name) ~> while {
 --- session_put(data) -> the state fragment a handler/terminal returns
 --- to (re)store `data` as the session: `{ session: { id: "",
 --- data, is_new: true } }`. Merge it into the returned `state`, e.g.
---- `{ resp: ..., state: hash_map.merge(ctx.state, session_put(d)) }`.
+--- `{ out: ..., state: hash_map.merge(ctx.state, session_put(d)) }`.
 export session_put := (data) ~> {
   session: { id: "", data: data, is_new: true } }
 
@@ -500,12 +418,12 @@ export session := (store, ...rest) ~> do {
       st := hash_map.get_or(r, "state", {})
       sess_out := hash_map.get_or(st, "session", null)
       if is_obj(sess_out) == false {
-        { resp: r.resp, state: r.state }
+        { out: r.out, state: r.state }
       } else {
         do {
           d := hash_map.get_or(sess_out, "data", null)
           if d == null {
-            { resp: r.resp, state: r.state }
+            { out: r.out, state: r.state }
           } else {
             do {
               id0 := hash_map.get_or(sess_out, "id", "")
@@ -524,7 +442,7 @@ export session := (store, ...rest) ~> do {
               }
               st2 := hash_map.set(st, "session",
                 { id: id, data: d, is_new: false })
-              { resp: with_headers(r.resp, pairs), state: st2 }
+              { out: with_headers(r.out, pairs), state: st2 }
             }
           }
         }
@@ -555,14 +473,14 @@ export auth := (verify, ...rest) ~> do {
     (ctx, next) ~> do {
       p := verify(ctx)
       if p == null {
-        { resp: set_header(
+        { out: set_header(
             { status: 401, body: "unauthorized" },
             "www-authenticate", challenge),
           state: state_of(ctx) }
       } else {
         r := next(hash_map.merge(ctx, { state: hash_map.set(
           state_of(ctx), key, p) }))
-        { resp: r.resp, state: r.state }
+        { out: r.out, state: r.state }
       }
     }
   }
@@ -593,14 +511,14 @@ export csrf := (check, ...rest) ~> do {
       if mem(m, methods) {
         if check(ctx) {
           r := next(ctx)
-          { resp: r.resp, state: r.state }
+          { out: r.out, state: r.state }
         } else {
-          { resp: { status: 403, body: "csrf check failed" },
+          { out: { status: 403, body: "csrf check failed" },
             state: state_of(ctx) }
         }
       } else {
         r := next(ctx)
-        { resp: r.resp, state: r.state }
+        { out: r.out, state: r.state }
       }
     }
   }
@@ -625,10 +543,10 @@ export body_limit := (n) ~> (ctx, next) ~> do {
     if is_str(b) { str.length(b) } else { 0 }
   }
   if sz > n {
-    { resp: { status: 413, body: "payload too large" },
+    { out: { status: 413, body: "payload too large" },
       state: state_of(ctx) }
   } else {
     r := next(ctx)
-    { resp: r.resp, state: r.state }
+    { out: r.out, state: r.state }
   }
 }

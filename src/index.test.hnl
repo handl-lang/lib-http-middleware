@@ -37,7 +37,7 @@ boom_h := (_ctx) ~> error.raise("terminal reached")
 
 --- next stub returning a fixed pair.
 next_ok := (ctx) ~> do {
-  { resp: { status: 200, body: "inner" }, state: ctx.state }
+  { out: { status: 200, body: "inner" }, state: ctx.state }
 }
 
 ctx_of := (req) ~> { req: req, state: {} }
@@ -71,8 +71,8 @@ test_state_get_missing := assert mw.state_get(
 --- middleware that wraps the response body with its tag on the way out.
 wrap := (tag) ~> (ctx, next) ~> do {
   r := next(ctx)
-  { resp: hash_map.merge(r.resp, {
-      body: tag + "(" + hash_map.get_or(r.resp, "body", "") + ")" }),
+  { out: hash_map.merge(r.out, {
+      body: tag + "(" + hash_map.get_or(r.out, "body", "") + ")" }),
     state: r.state }
 }
 
@@ -90,7 +90,7 @@ test_chain_end_adapter := assert run([
 test_pipeline_returns_pair := assert do {
   p := mw.pipeline([ok_h])(ctx_of(mkreq("GET", "/")))
   hash_map.get_or(p, "state", null) == {} &&
-  hash_map.get_or(p, "resp", null) == { status: 200, body: "ok" }
+  hash_map.get_or(p, "out", null) == { status: 200, body: "ok" }
 }
 
 --- a middleware (non-terminal) returning a bare resp is normalized to
@@ -113,12 +113,12 @@ test_chain_non_arrow_raises := assert match error.try(
 
 put_x := (v) ~> (ctx, next) ~> do {
   r := next(mw.state_put(ctx, "x", v))
-  { resp: r.resp, state: r.state }
+  { out: r.out, state: r.state }
 }
 
 put_y := (v) ~> (ctx, next) ~> do {
   r := next(mw.state_put(ctx, "y", v))
-  { resp: r.resp, state: r.state }
+  { out: r.out, state: r.state }
 }
 
 echo_xy := (ctx) ~> do {
@@ -132,7 +132,7 @@ test_ctx_merge_right_wins := assert run(
 
 --- outward state: terminal returns an updated state record.
 set_state_h := (ctx) ~> do {
-  { resp: { status: 200, body: "s" },
+  { out: { status: 200, body: "s" },
     state: hash_map.set(ctx.state, "done", true) }
 }
 
@@ -297,7 +297,7 @@ store_spy := {
 test_session_writeback := assert match error.try((x) ~> run([
   mw.session(store_spy, { mint: () ~> "sid-new" }),
   (ctx) ~> do {
-    { resp: { status: 200, body: "ok" },
+    { out: { status: 200, body: "ok" },
       state: hash_map.merge(ctx.state, mw.session_put("bob")) } }],
   mkreq("GET", "/"))) {
   err(e): str.find(e, "SET:sid-new=bob") >= 0,
@@ -311,7 +311,7 @@ store_spy2 := {
 test_session_writeback_existing_id := assert match error.try((x) ~> run([
   mw.session(store_spy2),
   (ctx) ~> do {
-    { resp: { status: 200, body: "ok" },
+    { out: { status: 200, body: "ok" },
       state: hash_map.set(ctx.state, "session",
         { id: "sid1", data: "carol", is_new: false }) } }],
   cookie_req("sid1"))) {
@@ -321,7 +321,7 @@ test_session_writeback_existing_id := assert match error.try((x) ~> run([
 test_session_set_cookie_new := assert do {
   r := run([mw.session(store_miss, { mint: () ~> "sid-new" }),
     (ctx) ~> do {
-      { resp: { status: 200, body: "ok" },
+      { out: { status: 200, body: "ok" },
         state: hash_map.merge(ctx.state, mw.session_put("d")) } }],
     mkreq("GET", "/"))
   geth(r, "set-cookie") ==
