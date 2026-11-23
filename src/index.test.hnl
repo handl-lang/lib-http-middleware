@@ -1,0 +1,455 @@
+--- http-middleware.test -- coverage for the onion pipeline
+--- (`src/index.hnl`): chain/pipeline folding, ctx.state merge
+--- semantics, every v1 middleware in isolation, short-circuits, and a
+--- serve-shaped integration pass.
+
+from "./index" import * as mw
+from "str" import * as str
+
+-- ---------------------------------------------------------------------
+-- fixtures
+-- ---------------------------------------------------------------------
+
+mkreq := (m, p) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: {}, body: "", body_bytes: null }
+}
+
+mkreqh := (m, p, hs) ~> do {
+  { method: m, path: p, query: "", version: "HTTP/1.1",
+    headers: hs, body: "", body_bytes: null }
+}
+
+hdr := (k, v) ~> hash_map.set({}, k, v)
+
+--- terminal handler: `(ctx) ~> resp`, echoes nothing.
+ok_h := (_ctx) ~> do {
+  { status: 200, body: "ok" }
+}
+
+--- terminal that proves it ran (body marker).
+mark_h := (tag) ~> (ctx) ~> do {
+  { status: 200, body: "T:" + tag }
+}
+
+--- terminal that must never run on a short-circuit.
+boom_h := (_ctx) ~> error.raise("terminal reached")
+
+--- next stub returning a fixed pair.
+next_ok := (ctx) ~> do {
+  { resp: { status: 200, body: "inner" }, state: ctx.state }
+}
+
+ctx_of := (req) ~> { req: req, state: {} }
+
+run := (steps, req) ~> mw.chain(steps)(req)
+
+geth := (resp, k) ~> hash_map.get_or(
+  hash_map.get_or(resp, "headers", {}), k, null)
+
+-- ---------------------------------------------------------------------
+-- state_get / state_put
+-- ---------------------------------------------------------------------
+
+test_state_put_new := assert mw.state_get(
+  mw.state_put(ctx_of(mkreq("GET", "/")), "k", "v"), "k") = "v"
+
+test_state_put_preserves := assert mw.state_get(
+  mw.state_put(mw.state_put(ctx_of(mkreq("GET", "/")), "a", 1),
+    "b", 2), "a") = 1
+
+test_state_put_right_wins := assert mw.state_get(
+  mw.state_put(ctx_of(mkreq("GET", "/")), "k", "new"), "k") = "new"
+
+test_state_get_missing := assert mw.state_get(
+  ctx_of(mkreq("GET", "/")), "nope") = null
+
+-- ---------------------------------------------------------------------
+-- chain / pipeline: ordering, fold direction, normalization
+-- ---------------------------------------------------------------------
+
+--- middleware that wraps the response body with its tag on the way out.
+wrap := (tag) ~> (ctx, next) ~> do {
+  r := next(ctx)
+  { resp: hash_map.merge(r.resp, {
+      body: tag + "(" + hash_map.get_or(r.resp, "body", "") + ")" }),
+    state: r.state }
+}
+
+test_chain_order := assert run([wrap("A"), wrap("B"), mark_h("T")],
+  mkreq("GET", "/")) = { status: 200, body: "A(B(T:T))" }
+
+test_chain_single_terminal := assert run([mark_h("only")],
+  mkreq("GET", "/")) = { status: 200, body: "T:only" }
+
+test_chain_end_adapter := assert run([
+  mw.end((req) ~> do {
+    { status: 200, body: "req:" + req.method } })],
+  mkreq("POST", "/x")) = { status: 200, body: "req:POST" }
+
+test_pipeline_returns_pair := assert do {
+  p := mw.pipeline([ok_h])(ctx_of(mkreq("GET", "/")))
+  hash_map.get_or(p, "state", null) == {} &&
+  hash_map.get_or(p, "resp", null) == { status: 200, body: "ok" }
+}
+
+--- a middleware (non-terminal) returning a bare resp is normalized to
+--- a pair carrying its incoming ctx.state.
+test_mw_bare_resp_normalized := assert run([
+  (ctx, next) ~> { status: 201, body: "bare" },
+  ok_h], mkreq("GET", "/")) = { status: 201, body: "bare" }
+
+test_chain_empty_raises := assert match error.try(
+  (x) ~> mw.chain([])(mkreq("GET", "/"))) {
+  err(e): true, ok(_): false }
+
+test_chain_non_arrow_raises := assert match error.try(
+  (x) ~> mw.chain([42, ok_h])(mkreq("GET", "/"))) {
+  err(e): true, ok(_): false }
+
+-- ---------------------------------------------------------------------
+-- ctx.state merge semantics through the onion
+-- ---------------------------------------------------------------------
+
+put_x := (v) ~> (ctx, next) ~> do {
+  r := next(mw.state_put(ctx, "x", v))
+  { resp: r.resp, state: r.state }
+}
+
+put_y := (v) ~> (ctx, next) ~> do {
+  r := next(mw.state_put(ctx, "y", v))
+  { resp: r.resp, state: r.state }
+}
+
+echo_xy := (ctx) ~> do {
+  { status: 200,
+    body: mw.state_get(ctx, "x") + "/" + mw.state_get(ctx, "y") }
+}
+
+test_ctx_merge_right_wins := assert run(
+  [put_x("outer"), put_x("inner"), put_y("why"), echo_xy],
+  mkreq("GET", "/")) = { status: 200, body: "inner/why" }
+
+--- outward state: terminal returns an updated state record.
+set_state_h := (ctx) ~> do {
+  { resp: { status: 200, body: "s" },
+    state: hash_map.set(ctx.state, "done", true) }
+}
+
+test_outward_state := assert do {
+  p := mw.pipeline([set_state_h])(ctx_of(mkreq("GET", "/")))
+  hash_map.get_or(hash_map.get_or(p, "state", {}), "done", false) == true
+}
+
+-- ---------------------------------------------------------------------
+-- cors
+-- ---------------------------------------------------------------------
+
+test_cors_actual := assert do {
+  r := run([mw.cors({}), ok_h], mkreqh("GET", "/",
+    hash_map.set({}, "origin", "https://ex.com")))
+  geth(r, "access-control-allow-origin") == "*"
+}
+
+test_cors_origin_request := assert do {
+  r := run([mw.cors({ origin: "request" }), ok_h], mkreqh("GET", "/",
+    hash_map.set({}, "origin", "https://ex.com")))
+  geth(r, "access-control-allow-origin") == "https://ex.com"
+}
+
+test_cors_origin_request_absent := assert do {
+  r := run([mw.cors({ origin: "request" }), ok_h], mkreq("GET", "/"))
+  geth(r, "access-control-allow-origin") == "*"
+}
+
+test_cors_credentials_expose := assert do {
+  r := run([mw.cors({ credentials: true, expose: "X-Custom" }), ok_h],
+    mkreq("GET", "/"))
+  geth(r, "access-control-allow-credentials") == "true" &&
+  geth(r, "access-control-expose-headers") == "X-Custom"
+}
+
+preflight_req := mkreqh("OPTIONS", "/api", hash_map.merge(
+  hash_map.set({}, "access-control-request-method", "POST"),
+  hash_map.set({}, "origin", "https://ex.com")))
+
+test_cors_preflight := assert do {
+  r := run([mw.cors({ max_age: 600 }), ok_h], preflight_req)
+  r.status == 204 &&
+  geth(r, "access-control-allow-methods") ==
+    "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS" &&
+  geth(r, "access-control-allow-headers") == "Content-Type, Authorization" &&
+  geth(r, "access-control-max-age") == "600" &&
+  geth(r, "access-control-allow-origin") == "*"
+}
+
+test_cors_preflight_short_circuits := assert run(
+  [mw.cors({}), boom_h], preflight_req).status == 204
+
+test_cors_options_without_acrm_passes := assert run(
+  [mw.cors({}), mark_h("T")],
+  mkreq("OPTIONS", "/")).body == "T:T"
+
+-- ---------------------------------------------------------------------
+-- logger
+-- ---------------------------------------------------------------------
+
+--- emit spy: raises with the record encoded so error.try can see it.
+emit_spy := (l, lvl, msg, attrs) ~> error.raise(
+  "EMIT:" + lvl + ":" + msg + ":" + attrs.method + ":" + attrs.path +
+  ":" + type.to_string(attrs.status) + ":" +
+  type.to_string(attrs.duration))
+
+test_logger_emits := assert match error.try((x) ~> run([
+  mw.logger({}, { emit: emit_spy, now: () ~> 10 }),
+  mark_h("T")], mkreq("GET", "/p"))) {
+  err(e): str.find(e, "EMIT:info:http request:GET:/p:200:0") >= 0,
+  ok(_): false }
+
+test_logger_level_msg_fn := assert match error.try((x) ~> run([
+  mw.logger({}, { emit: emit_spy, level: "warn",
+    msg: (ctx, resp) ~> "done:" + type.to_string(
+      hash_map.get_or(resp, "status", 0)) }),
+  ok_h], mkreq("DELETE", "/q"))) {
+  err(e): str.find(e, "EMIT:warn:done:200:DELETE:/q:200:0") >= 0,
+  ok(_): false }
+
+test_logger_default_noop := assert run([mw.logger({}), ok_h],
+  mkreq("GET", "/")).status == 200
+
+-- ---------------------------------------------------------------------
+-- request_id
+-- ---------------------------------------------------------------------
+
+test_rid_propagates := assert do {
+  r := run([mw.request_id({}), ok_h], mkreqh("GET", "/", hdr(
+    "x-request-id", "rid-123")))
+  geth(r, "x-request-id") == "rid-123"
+}
+
+test_rid_mints := assert do {
+  r := run([mw.request_id({ mint: () ~> "minted-1" }), ok_h],
+    mkreq("GET", "/"))
+  geth(r, "x-request-id") == "minted-1"
+}
+
+test_rid_in_state := assert do {
+  r := run([
+    mw.request_id({ mint: () ~> "rid-x" }),
+    (ctx) ~> do {
+      { status: 200, body: mw.state_get(ctx, "request_id") } }],
+    mkreq("GET", "/"))
+  r.body == "rid-x" && geth(r, "x-request-id") == "rid-x"
+}
+
+test_rid_custom_header_key := assert do {
+  r := run([mw.request_id({ header: "x-trace", key: "trace" }), ok_h],
+    mkreq("GET", "/"))
+  geth(r, "x-trace") != null
+}
+
+-- ---------------------------------------------------------------------
+-- session
+-- ---------------------------------------------------------------------
+
+store_hit := {
+  get: (k) ~> if k == "sid1" { { user: "alice" } } else { null },
+  set: (k, v) ~> null
+}
+
+store_miss := {
+  get: (k) ~> null,
+  set: (k, v) ~> null
+}
+
+cookie_req := (sid) ~> mkreqh("GET", "/", hdr("cookie",
+  "other=1; handl_session=" + sid + "; theme=dark"))
+
+test_session_loads := assert run([
+  mw.session(store_hit),
+  (ctx) ~> do {
+    { status: 200,
+      body: hash_map.get_or(mw.session_data(ctx), "user", "none") } }],
+  cookie_req("sid1")) = { status: 200, body: "alice" }
+
+test_session_absent := assert run([
+  mw.session(store_hit),
+  (ctx) ~> do {
+    { status: 200,
+      body: if mw.session_data(ctx) == null { "none" } else { "yes" } } }],
+  mkreq("GET", "/")) = { status: 200, body: "none" }
+
+test_session_store_miss := assert run([
+  mw.session(store_hit),
+  (ctx) ~> do {
+    s := hash_map.get_or(ctx.state, "session", null)
+    { status: 200,
+      body: if s == null { "none" }
+        else { hash_map.get_or(s, "id", "no-id") } } }],
+  cookie_req("unknown")) = { status: 200, body: "unknown" }
+
+--- write-back spy: set raises with "k=v" so error.try observes it.
+store_spy := {
+  get: (k) ~> null,
+  set: (k, v) ~> error.raise("SET:" + k + "=" + v)
+}
+
+test_session_writeback := assert match error.try((x) ~> run([
+  mw.session(store_spy, { mint: () ~> "sid-new" }),
+  (ctx) ~> do {
+    { resp: { status: 200, body: "ok" },
+      state: hash_map.merge(ctx.state, mw.session_put("bob")) } }],
+  mkreq("GET", "/"))) {
+  err(e): str.find(e, "SET:sid-new=bob") >= 0,
+  ok(_): false }
+
+store_spy2 := {
+  get: (k) ~> if k == "sid1" { { user: "alice" } } else { null },
+  set: (k, v) ~> error.raise("SET:" + k + "=" + v)
+}
+
+test_session_writeback_existing_id := assert match error.try((x) ~> run([
+  mw.session(store_spy2),
+  (ctx) ~> do {
+    { resp: { status: 200, body: "ok" },
+      state: hash_map.set(ctx.state, "session",
+        { id: "sid1", data: "carol", is_new: false }) } }],
+  cookie_req("sid1"))) {
+  err(e): str.find(e, "SET:sid1=carol") >= 0,
+  ok(_): false }
+
+test_session_set_cookie_new := assert do {
+  r := run([mw.session(store_miss, { mint: () ~> "sid-new" }),
+    (ctx) ~> do {
+      { resp: { status: 200, body: "ok" },
+        state: hash_map.merge(ctx.state, mw.session_put("d")) } }],
+    mkreq("GET", "/"))
+  geth(r, "set-cookie") ==
+    "handl_session=sid-new; Path=/; HttpOnly"
+}
+
+test_session_no_cookie_no_setcookie := assert do {
+  r := run([mw.session(store_miss), ok_h], mkreq("GET", "/"))
+  geth(r, "set-cookie") == null
+}
+
+test_session_bad_store_raises := assert match error.try(
+  (x) ~> mw.session({})(mkreq("GET", "/"), next_ok)) {
+  err(e): true, ok(_): false }
+
+-- ---------------------------------------------------------------------
+-- auth
+-- ---------------------------------------------------------------------
+
+auth_req := mkreqh("GET", "/secret", hash_map.set({},
+  "authorization", "Bearer tok"))
+
+verify_tok := (ctx) ~> do {
+  a := hash_map.get_or(hash_map.get_or(ctx, "req", {}),
+    "headers", {})
+  if hash_map.get_or(a, "authorization", null) == "Bearer tok" {
+    { user: "u1", role: "admin" }
+  } else {
+    null
+  }
+}
+
+test_auth_401 := assert run([mw.auth(verify_tok), boom_h],
+  mkreq("GET", "/secret")) =
+  { status: 401, body: "unauthorized",
+    headers: hash_map.set({}, "www-authenticate", "Bearer") }
+
+test_auth_401_short_circuits := assert run([mw.auth(verify_tok),
+  boom_h], mkreq("GET", "/secret")).status == 401
+
+test_auth_principal := assert run([mw.auth(verify_tok),
+  (ctx) ~> do {
+    { status: 200,
+      body: hash_map.get_or(mw.principal(ctx), "user", "none") } }],
+  auth_req) = { status: 200, body: "u1" }
+
+test_auth_custom_key_challenge := assert run([
+  mw.auth(verify_tok, { key: "who", challenge: "Basic" }),
+  (ctx) ~> do {
+    { status: 200,
+      body: hash_map.get_or(mw.state_get(ctx, "who"), "role", "none") } }],
+  auth_req) = { status: 200, body: "admin" }
+
+test_auth_bad_verify_raises := assert match error.try(
+  (x) ~> mw.auth(42)(mkreq("GET", "/"), next_ok)) {
+  err(e): true, ok(_): false }
+
+-- ---------------------------------------------------------------------
+-- csrf
+-- ---------------------------------------------------------------------
+
+csrf_check := (ctx) ~> do {
+  hs := hash_map.get_or(hash_map.get_or(ctx, "req", {}),
+    "headers", {})
+  hash_map.get_or(hs, "x-csrf-token", null) == "tok"
+}
+
+post_bad := mkreqh("POST", "/form", hash_map.set({},
+  "x-csrf-token", "wrong"))
+post_good := mkreqh("POST", "/form", hash_map.set({},
+  "x-csrf-token", "tok"))
+
+test_csrf_rejects := assert run([mw.csrf(csrf_check), boom_h],
+  post_bad) = { status: 403, body: "csrf check failed" }
+
+test_csrf_accepts := assert run([mw.csrf(csrf_check), mark_h("T")],
+  post_good).body == "T:T"
+
+test_csrf_skips_safe_methods := assert run([mw.csrf(csrf_check),
+  mark_h("T")], mkreq("GET", "/form")).body == "T:T"
+
+test_csrf_custom_methods := assert run([
+  mw.csrf(csrf_check, { methods: ["GET"] }), boom_h],
+  mkreq("GET", "/form")).status == 403
+
+-- ---------------------------------------------------------------------
+-- body_limit
+-- ---------------------------------------------------------------------
+
+req_body := (b) ~> do {
+  r := mkreq("POST", "/up")
+  hash_map.set(r, "body", b)
+}
+
+test_body_limit_pass := assert run([mw.body_limit(5), mark_h("T")],
+  req_body("hello")).body == "T:T"
+
+test_body_limit_reject := assert run([mw.body_limit(4), boom_h],
+  req_body("hello")) = { status: 413, body: "payload too large" }
+
+test_body_limit_empty_ok := assert run([mw.body_limit(0), ok_h],
+  mkreq("POST", "/")).status == 200
+
+-- ---------------------------------------------------------------------
+-- integration: serve-shaped chain
+-- ---------------------------------------------------------------------
+
+--- a "router" in `(req) ~> resp` shape, plugged via `end`.
+tiny_router := (req) ~> do {
+  if req.path == "/health" {
+    { status: 200, body: "healthy" }
+  } else {
+    { status: 404, body: "not found" }
+  }
+}
+
+test_integration_shape := assert do {
+  srv := mw.chain([
+    mw.cors({}),
+    mw.request_id({ mint: () ~> "it-1" }),
+    mw.auth(verify_tok),
+    mw.csrf(csrf_check),
+    mw.end(tiny_router)])
+  r1 := srv(mkreqh("GET", "/health", hash_map.set({},
+    "authorization", "Bearer tok")))
+  r2 := srv(mkreq("GET", "/health"))
+  r1.body == "healthy" && r1.status == 200 &&
+  geth(r1, "x-request-id") == "it-1" &&
+  geth(r1, "access-control-allow-origin") == "*" &&
+  r2.status == 401
+}

@@ -1,0 +1,634 @@
+--- http-middleware -- onion-style request pipeline for handl HTTP servers.
+---
+--- Sits between `serve`/`serve-epoll` (which hand the handler a parsed
+--- lib-http-rfc request record `{ method, target, path, query, version,
+--- headers, body, body_bytes }` and expect a response record back
+--- `{ status?, headers?, body? | body_bytes? }`) and `http-route`'s
+--- router. Middleware wraps the router onion-style: each layer can
+--- inspect/transform the request, short-circuit with its own response
+--- (auth 401, CORS preflight, body-limit 413), or post-process the
+--- response on the way out.
+---
+--- Protocol (proposal-0007):
+---
+---   ctx      := { req: Request, state: State, ... }   -- explicit record,
+---                                                  -- threaded, no cells
+---   next     := (ctx) ~> { resp, state }             -- the rest of chain
+---   mw       := (ctx, next) ~> { resp, state }       -- a middleware
+---   terminal := (ctx) ~> resp | { resp, state }      -- LAST step of chain;
+---                                                  -- usually the router
+---                                                  -- (wrap a `(req) ~> resp`
+---                                                  -- handler with `end/1`)
+---
+--- State merges right-wins: a middleware passes state inward with
+--- `hash_map.merge(ctx.state, additions)` (its own keys win over what it
+--- received) and returns the state it wants propagated outward in the
+--- `{ resp, state }` pair. Returning a bare response record is allowed —
+--- it is normalized to `{ resp, state: <incoming ctx.state> }`.
+---
+--- `chain([mw1, mw2, ..., terminal])` folds right-to-left into one
+--- serve-ready `(req) ~> resp`: it seeds `ctx = { req, state: {} }`, so
+--- `serve(chain([...]), { port })` works directly. `pipeline(steps)` is
+--- the same fold exposed as `(ctx) ~> { resp, state }` for callers that
+--- want to seed state or keep the outward state.
+---
+--- v1 middleware (each a factory returning `(ctx, next) ~> { resp, state }`):
+---   cors(opts)        Access-Control-* headers; OPTIONS preflight
+---                      short-circuits 204 before routing.
+---   logger(log, opts?)  method/path/status/duration -> lib-log emit port.
+---   request_id(opts)  propagate or mint `x-request-id` into ctx.state
+---                      and the response headers.
+---   session(store,opts?)  cookie <-> session record via a `{get,set}`
+---                      store port; helpers `session_put`/`session_data`.
+---   auth(verify,opts?) credential -> principal in ctx.state; 401
+---                      short-circuit when verify returns null.
+---   csrf(check,opts?)  token check on mutating methods; 403 short-circuit.
+---   body_limit(n)     413 short-circuit on oversized bodies.
+---
+--- Non-goals v1: static files, compression, rate limiting, WebSocket
+--- upgrade, streaming bodies.
+---
+--- Exports:
+---   chain(steps)        ~> (req) ~> resp          -- serve-ready
+---   pipeline(steps)     ~> (ctx) ~> { resp, state }
+---   end(h)              ~> (ctx) ~> resp          -- adapt `(req) ~> resp`
+---   state_get(ctx,k)    ~> value | null           -- ctx.state lookup
+---   state_put(ctx,k,v)  ~> new ctx               -- ctx.state write helper
+---   cors(opts)          ~> middleware
+---   logger(log, opts?)  ~> middleware
+---   request_id(opts)    ~> middleware
+---   session(store,opts?) ~> middleware
+---   session_put(data)   ~> state fragment `{ session: {...} }`
+---   session_data(ctx)   ~> session data | null
+---   auth(verify,opts?)  ~> middleware
+---   principal(ctx)      ~> principal | null
+---   csrf(check,opts?)   ~> middleware
+---   body_limit(n)       ~> middleware
+
+from "str" import * as str
+
+-- ---------------------------------------------------------------------
+-- small helpers (same shapes as http-route's private ones)
+-- ---------------------------------------------------------------------
+
+alen := (xs) ~> while { xs: xs, n: 0 } {
+  (xs, n) ~> match xs {
+    []: { out: n },
+    [_h, ...t]: { state: { xs: t, n: n + 1 } }
+  }
+}
+
+mem := (x, xs) ~> while { xs: xs, found: false } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [h, ...t]: if h == x {
+      { out: true }
+    } else {
+      { state: { xs: t, found: found } }
+    }
+  }
+}
+
+revlist := (xs) ~> while { xs: xs, out: [] } {
+  (xs, out) ~> match xs {
+    []: { out: out },
+    [h, ...t]: { state: { xs: t, out: [h, ...out] } }
+  }
+}
+
+is_obj    := (v) ~> type.of(v) == "object"
+is_arr    := (v) ~> type.of(v) == "array"
+is_str    := (v) ~> type.of(v) == "string"
+is_arrow  := (v) ~> type.of(v) == "arrow"
+
+state_of := (ctx) ~> hash_map.get_or(ctx, "state", {})
+req_of   := (ctx) ~> hash_map.get_or(ctx, "req", {})
+
+--- string-or-render for header values (ints pass through verbatim).
+str_of := (v) ~> if is_str(v) { v } else { type.to_string(v) }
+
+--- opts record with defaults; non-record input means "no opts".
+opts_of := (o, d) ~> if is_obj(o) { o } else { d }
+
+opt := (o, k, d) ~> hash_map.get_or(o, k, d)
+
+--- first element of a `...rest` variadic tail, or null.
+rest0 := (rest) ~> match rest {
+  [h, ..._t]: h,
+  []: null
+}
+
+-- ---------------------------------------------------------------------
+-- { resp, state } pair plumbing
+-- ---------------------------------------------------------------------
+
+--- normalize any step result to the `{ resp, state }` pair. A record
+--- carrying a `resp` key is already a pair (missing `state` falls back
+--- to the ctx the step saw); anything else is a bare response.
+as_pair := (r, ctx) ~> do {
+  if is_obj(r) && hash_map.has(r, "resp") {
+    { resp: hash_map.get_or(r, "resp", null),
+      state: hash_map.get_or(r, "state", state_of(ctx)) }
+  } else {
+    { resp: r, state: state_of(ctx) }
+  }
+}
+
+--- set one response header (lowercase name by convention — the wire
+--- codec emits header record keys verbatim).
+set_header := (resp, k, v) ~> do {
+  hs := hash_map.get_or(resp, "headers", {})
+  hash_map.merge(resp, { headers: hash_map.set(hs, k, v) })
+}
+
+--- fold `[[k, v], ...]` pairs into a headers record.
+put_hs := (hs, pairs) ~> while { xs: pairs, acc: hs } {
+  (xs, acc) ~> match xs {
+    []: { out: acc },
+    [[k, v], ...t]: { state: { xs: t, acc: hash_map.set(acc, k, v) } }
+  }
+}
+
+--- merge `[[k, v], ...]` pairs into resp.headers (right wins); a
+--- empty pair list returns resp untouched (no spurious `headers: {}`).
+with_headers := (resp, pairs) ~> do {
+  if alen(pairs) == 0 {
+    resp
+  } else {
+    hs := hash_map.get_or(resp, "headers", {})
+    hash_map.merge(resp, { headers: put_hs(hs, pairs) })
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- ctx.state accessors (exported for handlers/middleware authors)
+-- ---------------------------------------------------------------------
+
+export state_get := (ctx, k) ~> hash_map.get_or(state_of(ctx), k, null)
+
+--- returns a NEW ctx with `k -> v` merged into state (right-wins: v
+--- overrides any existing `k`).
+export state_put := (ctx, k, v) ~> do {
+  hash_map.merge(ctx, { state: hash_map.set(state_of(ctx), k, v) })
+}
+
+-- ---------------------------------------------------------------------
+-- pipeline / chain
+-- ---------------------------------------------------------------------
+
+--- validate every step is an arrow.
+all_arrows := (xs) ~> while { xs: xs, ok: true } {
+  (xs, ok) ~> match xs {
+    []: { out: ok },
+    [h, ...t]: if is_arrow(h) {
+      { state: { xs: t, ok: ok } }
+    } else {
+      { out: false }
+    }
+  }
+}
+
+--- fold `steps` right-to-left into `(ctx) ~> { resp, state }`.
+--- steps = [mw..., terminal]; every element but the last is a
+--- middleware `(ctx, next) ~> { resp, state }`; the last is the
+--- terminal `(ctx) ~> resp | { resp, state }`.
+export pipeline := (steps) ~> do {
+  if is_arr(steps) == false || alen(steps) == 0 {
+    error.raise("http-middleware: pipeline needs a non-empty list of steps")
+  } else {
+    if all_arrows(steps) == false {
+      error.raise("http-middleware: every pipeline step must be an arrow")
+    } else {
+      do {
+        rs := revlist(steps)              -- [terminal, mwN, ..., mw1]
+        term := rs[0]
+        termn := (ctx) ~> as_pair(term(ctx), ctx)
+        mids := match rs {
+          [_t, ...t]: t,
+          []: []
+        }
+        acc := while { xs: mids, acc: termn } {
+          (xs, acc) ~> match xs {
+            []: { out: acc },
+            [mw, ...t]: do {
+              nxt := acc
+              { state: { xs: t,
+                acc: (ctx) ~> as_pair(mw(ctx, nxt), ctx) } }
+            }
+          }
+        }
+        acc
+      }
+    }
+  }
+}
+
+--- serve-ready handler: `serve(chain([mw..., router_or_end]), { port })`.
+--- Seeds `ctx = { req, state: {} }` and returns the final `resp`.
+export chain := (steps) ~> do {
+  p := pipeline(steps)
+  (req) ~> do {
+    r := p({ req: req, state: {} })
+    r.resp
+  }
+}
+
+--- adapt a `(req) ~> resp` handler (e.g. `http-route`'s `router(routes)`
+--- output) into a `(ctx) ~> resp` terminal for `pipeline`/`chain`.
+export end := (h) ~> (ctx) ~> h(req_of(ctx))
+
+-- ---------------------------------------------------------------------
+-- cors
+-- ---------------------------------------------------------------------
+
+--- cors(opts) -> middleware. opts (all optional):
+---   origin       String, default "*"; "request" echoes the request's
+---                `origin` header (or "*" when absent)
+---   credentials  Bool, default false -> `access-control-allow-credentials`
+---   methods      String, default "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
+---   headers      String, default "Content-Type, Authorization"
+---   max_age      Int, optional -> `access-control-max-age`
+---   expose       String, optional -> `access-control-expose-headers`
+---
+--- OPTIONS requests carrying `access-control-request-method` are
+--- preflights: answered 204 with the allow-* headers, `next` never runs.
+export cors := (opts) ~> do {
+  o := opts_of(opts, {})
+  origin    := opt(o, "origin", "*")
+  creds     := opt(o, "credentials", false) == true
+  methods   := opt(o, "methods",
+    "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS")
+  req_hdrs  := opt(o, "headers", "Content-Type, Authorization")
+  max_age   := opt(o, "max_age", null)
+  expose    := opt(o, "expose", null)
+
+  allow_origin := (req) ~> if origin == "request" {
+    h := hash_map.get_or(hash_map.get_or(req, "headers", {}),
+      "origin", null)
+    if is_str(h) && str.is_empty(h) == false { h } else { "*" }
+  } else {
+    origin
+  }
+
+  --- headers for a normal (non-preflight) response.
+  actual_pairs := (req) ~> do {
+    p := [["access-control-allow-origin", allow_origin(req)]]
+    p2 := if creds {
+      [...p, ["access-control-allow-credentials", "true"]]
+    } else { p }
+    if expose == null {
+      p2
+    } else {
+      [...p2, ["access-control-expose-headers", str_of(expose)]]
+    }
+  }
+
+  (ctx, next) ~> do {
+    req := req_of(ctx)
+    m := hash_map.get_or(req, "method", "")
+    rqhs := hash_map.get_or(req, "headers", {})
+    pre := m == "OPTIONS" &&
+      hash_map.has(rqhs, "access-control-request-method")
+    if pre {
+      ps := [...actual_pairs(req),
+        ["access-control-allow-methods", methods],
+        ["access-control-allow-headers", req_hdrs]]
+      ps2 := if max_age == null {
+        ps
+      } else {
+        [...ps, ["access-control-max-age", str_of(max_age)]]
+      }
+      { resp: { status: 204,
+               headers: put_hs({}, ps2),
+               body: "" },
+        state: state_of(ctx) }
+    } else {
+      r := next(ctx)
+      { resp: with_headers(r.resp, actual_pairs(req)),
+        state: r.state }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- logger — method/path/status/duration through a lib-log emit port
+-- ---------------------------------------------------------------------
+
+--- default clock: no host clock in pure handl — inject a real one via
+--- opts.now (e.g. a posix/time-backed `() ~> ms`).
+no_clock := () ~> 0
+
+--- default emit: no-op. Pass a lib-log backend's emit arrow
+--- `(logger, level, msg, attrs) ~> unit` (e.g. log-c's `log/4`) via
+--- opts.emit, or any arrow of that shape.
+no_emit := (l, lvl, msg, attrs) ~> null
+
+--- logger(log, opts?) -> middleware. `log` is a lib-log Logger record.
+--- opts (all optional):
+---   emit   (l, lvl, msg, attrs) ~> unit   -- default no-op
+---   now    () ~> Number                  -- default constant 0
+---   level  String, default "info"
+---   msg    String | (ctx, resp) ~> String, default "http request"
+--- Emits ONE record per request after `next` returns, with attrs
+--- `{ method, path, status, duration }` (duration in `now`'s units).
+export logger := (lg, ...rest) ~> do {
+  o := opts_of(rest0(rest), {})
+  emit   := opt(o, "emit", no_emit)
+  nowf   := opt(o, "now", no_clock)
+  lvl    := opt(o, "level", "info")
+  msgf   := opt(o, "msg", "http request")
+  (ctx, next) ~> do {
+    t0 := nowf()
+    r := next(ctx)
+    resp := hash_map.get_or(r, "resp", {})
+    req := req_of(ctx)
+    attrs := {
+      method: hash_map.get_or(req, "method", ""),
+      path: hash_map.get_or(req, "path", ""),
+      status: hash_map.get_or(resp, "status", 200),
+      duration: nowf() - t0
+    }
+    msg := if is_arrow(msgf) {
+      msgf(ctx, resp)
+    } else {
+      msgf
+    }
+    emit(lg, lvl, msg, attrs)
+    { resp: r.resp, state: r.state }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- request_id
+-- ---------------------------------------------------------------------
+
+--- best-effort default mint: `rand.*` is the stub backend in minimal
+--- runtimes (deterministic) — inject a uuid.v4-backed mint for
+--- production: request_id({ mint: () ~> uuid.v4() }).
+default_mint := () ~> "req-" + type.to_string(rand.int(2147483647))
+
+--- request_id(opts) -> middleware. opts (all optional):
+---   header  String, default "x-request-id" — request header to
+---           propagate (lookup is exact, then lowercased) and the
+---           response header to set.
+---   mint    () ~> String, default rand-based "req-<n>"
+---   key     String, default "request_id" — ctx.state key
+--- The id lands in `ctx.state[key]` for downstream middleware/handlers
+--- and is always written back onto the response headers.
+export request_id := (opts) ~> do {
+  o := opts_of(opts, {})
+  hn  := opt(o, "header", "x-request-id")
+  mint := opt(o, "mint", default_mint)
+  key := opt(o, "key", "request_id")
+  (ctx, next) ~> do {
+    req := req_of(ctx)
+    hs := hash_map.get_or(req, "headers", {})
+    existing := hash_map.get_or(hs, hn,
+      hash_map.get_or(hs, str.lower(hn), null))
+    rid := if is_str(existing) && str.is_empty(existing) == false {
+      existing
+    } else {
+      mint()
+    }
+    ctx2 := hash_map.merge(ctx, {
+      state: hash_map.set(state_of(ctx), key, rid) })
+    r := next(ctx2)
+    { resp: set_header(r.resp, hn, rid), state: r.state }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- session — cookie <-> record via a store port
+-- ---------------------------------------------------------------------
+
+--- the store port: a record `{ get: (key) ~> value|null,
+--- set: (key, value) ~> unit }`. `lib-kv`-style or hashmap-backed
+--- records both fit; effects are the store's business.
+
+best_effort_sid := () ~> "s-" + type.to_string(rand.int(2147483647))
+
+--- first `name=value` pair out of a `cookie` header value, or null.
+cookie_get := (hdr, name) ~> while {
+  xs: str.split(hdr, ";"), found: null } {
+  (xs, found) ~> match xs {
+    []: { out: found },
+    [s, ...t]: do {
+      seg := str.trim(s)
+      i := str.find(seg, "=")
+      if i < 0 {
+        { state: { xs: t, found: found } }
+      } else {
+        do {
+          k := str.trim(str.slice(seg, 0, i))
+          v := str.trim(str.slice(seg, i + 1, str.length(seg)))
+          if k == name {
+            { out: v }
+          } else {
+            { state: { xs: t, found: found } }
+          }
+        }
+      }
+    }
+  }
+}
+
+--- session_put(data) -> the state fragment a handler/terminal returns
+--- to (re)store `data` as the session: `{ session: { id: "",
+--- data, is_new: true } }`. Merge it into the returned `state`, e.g.
+--- `{ resp: ..., state: hash_map.merge(ctx.state, session_put(d)) }`.
+export session_put := (data) ~> {
+  session: { id: "", data: data, is_new: true } }
+
+--- session_data(ctx) -> the session record's `data` field, or null.
+export session_data := (ctx) ~> do {
+  s := hash_map.get_or(state_of(ctx), "session", null)
+  if is_obj(s) {
+    hash_map.get_or(s, "data", null)
+  } else {
+    null
+  }
+}
+
+--- session(store, opts?) -> middleware. `store` is the `{get,set}`
+--- port record above. opts (all optional):
+---   cookie    String, default "handl_session"
+---   mint      () ~> String, default rand-based "s-<n>" — inject
+---             uuid.v4-backed mint for production
+---   path      String, default "/"        -- Set-Cookie Path
+---   httponly  Bool,   default true
+---   secure    Bool,   default false      -- adds `; Secure`
+---
+--- Inbound: reads the `cookie` header, `store.get(sid)` on hit, and
+--- merges `state.session = { id, data, is_new }` into ctx (right-wins).
+--- Outbound: if the returned `state.session.data` is non-null it is
+--- written back via `store.set(id, data)`; a fresh/minted id also gets
+--- a `set-cookie` response header (existing `set-cookie` is replaced —
+--- the wire codec cannot emit repeated header keys, v1 limitation).
+export session := (store, ...rest) ~> do {
+  o := opts_of(rest0(rest), {})
+  cname    := opt(o, "cookie", "handl_session")
+  mint     := opt(o, "mint", best_effort_sid)
+  cpath    := opt(o, "path", "/")
+  httponly := opt(o, "httponly", true) == true
+  secure   := opt(o, "secure", false) == true
+
+  getf := hash_map.get_or(store, "get", null)
+  setf := hash_map.get_or(store, "set", null)
+  if is_obj(store) == false || is_arrow(getf) == false ||
+     is_arrow(setf) == false {
+    error.raise("http-middleware: session store must be a record " +
+      "{ get: (k) ~> v, set: (k, v) ~> u } of arrows")
+  } else {
+    (ctx, next) ~> do {
+      hs := hash_map.get_or(req_of(ctx), "headers", {})
+      ch := hash_map.get_or(hs, "cookie", "")
+      sid := if is_str(ch) { cookie_get(ch, cname) } else { null }
+      has_sid := is_str(sid) && str.is_empty(sid) == false
+      data := if has_sid { getf(sid) } else { null }
+      sess_in := if has_sid {
+        { id: sid, data: data, is_new: false }
+      } else {
+        null
+      }
+      ctx2 := if sess_in == null {
+        ctx
+      } else {
+        hash_map.merge(ctx, { state: hash_map.set(
+          state_of(ctx), "session", sess_in) })
+      }
+      r := next(ctx2)
+      st := hash_map.get_or(r, "state", {})
+      sess_out := hash_map.get_or(st, "session", null)
+      if is_obj(sess_out) == false {
+        { resp: r.resp, state: r.state }
+      } else {
+        do {
+          d := hash_map.get_or(sess_out, "data", null)
+          if d == null {
+            { resp: r.resp, state: r.state }
+          } else {
+            do {
+              id0 := hash_map.get_or(sess_out, "id", "")
+              keep := is_str(id0) && str.is_empty(id0) == false
+              id := if keep { id0 } else { mint() }
+              setf(id, d)
+              fresh := keep == false ||
+                hash_map.get_or(sess_out, "is_new", false) == true
+              pairs := if fresh {
+                [["set-cookie",
+                  cname + "=" + id + "; Path=" + cpath +
+                  (if httponly { "; HttpOnly" } else { "" }) +
+                  (if secure { "; Secure" } else { "" })]]
+              } else {
+                []
+              }
+              st2 := hash_map.set(st, "session",
+                { id: id, data: d, is_new: false })
+              { resp: with_headers(r.resp, pairs), state: st2 }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- auth
+-- ---------------------------------------------------------------------
+
+--- auth(verify, opts?) -> middleware. `verify` is `(ctx) ~> principal |
+--- null` — put `session` BEFORE `auth` in the chain so verify can read
+--- `state_get(ctx, "session")`. null -> 401 short-circuit
+--- (`www-authenticate` header, body "unauthorized"); otherwise the
+--- principal merges into `ctx.state[key]` (default "principal") for
+--- downstream middleware and the terminal. opts:
+---   key       String, default "principal"
+---   challenge String, default "Bearer"  -- www-authenticate value
+export auth := (verify, ...rest) ~> do {
+  o := opts_of(rest0(rest), {})
+  key       := opt(o, "key", "principal")
+  challenge := opt(o, "challenge", "Bearer")
+  if is_arrow(verify) == false {
+    error.raise("http-middleware: auth verify must be an arrow")
+  } else {
+    (ctx, next) ~> do {
+      p := verify(ctx)
+      if p == null {
+        { resp: set_header(
+            { status: 401, body: "unauthorized" },
+            "www-authenticate", challenge),
+          state: state_of(ctx) }
+      } else {
+        r := next(hash_map.merge(ctx, { state: hash_map.set(
+          state_of(ctx), key, p) }))
+        { resp: r.resp, state: r.state }
+      }
+    }
+  }
+}
+
+--- principal(ctx) -> the value auth stored under state "principal",
+--- or null.
+export principal := (ctx) ~> state_get(ctx, "principal")
+
+-- ---------------------------------------------------------------------
+-- csrf
+-- ---------------------------------------------------------------------
+
+--- csrf(check, opts?) -> middleware. `check` is `(ctx) ~> Bool` run on
+--- mutating methods only; false -> 403 short-circuit
+--- (`{ status: 403, body: "csrf check failed" }`). opts:
+---   methods  list of method names, default
+---            ["POST", "PUT", "PATCH", "DELETE"]
+export csrf := (check, ...rest) ~> do {
+  o := opts_of(rest0(rest), {})
+  methods := opt(o, "methods",
+    ["POST", "PUT", "PATCH", "DELETE"])
+  if is_arrow(check) == false {
+    error.raise("http-middleware: csrf check must be an arrow")
+  } else {
+    (ctx, next) ~> do {
+      m := hash_map.get_or(req_of(ctx), "method", "")
+      if mem(m, methods) {
+        if check(ctx) {
+          r := next(ctx)
+          { resp: r.resp, state: r.state }
+        } else {
+          { resp: { status: 403, body: "csrf check failed" },
+            state: state_of(ctx) }
+        }
+      } else {
+        r := next(ctx)
+        { resp: r.resp, state: r.state }
+      }
+    }
+  }
+}
+
+-- ---------------------------------------------------------------------
+-- body_limit
+-- ---------------------------------------------------------------------
+
+--- body_limit(n) -> middleware. Rejects with 413
+--- (`{ status: 413, body: "payload too large" }`) when the buffered
+--- body exceeds `n` bytes — `body_bytes` length when present, else
+--- `str.length(body)`. Runs before `next`, so oversized bodies never
+--- reach the router.
+export body_limit := (n) ~> (ctx, next) ~> do {
+  req := req_of(ctx)
+  bb := hash_map.get_or(req, "body_bytes", null)
+  sz := if bb != null {
+    bytes.len(bb)
+  } else {
+    b := hash_map.get_or(req, "body", "")
+    if is_str(b) { str.length(b) } else { 0 }
+  }
+  if sz > n {
+    { resp: { status: 413, body: "payload too large" },
+      state: state_of(ctx) }
+  } else {
+    r := next(ctx)
+    { resp: r.resp, state: r.state }
+  }
+}
