@@ -52,17 +52,17 @@ geth := (resp, k) ~> hash_map.get_or(
 -- ---------------------------------------------------------------------
 
 test_state_put_new := assert mw.state_get(
-  mw.state_put(ctx_of(mkreq("GET", "/")), "k", "v"), "k") = "v"
+  mw.state_put(ctx_of(mkreq("GET", "/")), "k", "v"), "k") == "v"
 
 test_state_put_preserves := assert mw.state_get(
   mw.state_put(mw.state_put(ctx_of(mkreq("GET", "/")), "a", 1),
-    "b", 2), "a") = 1
+    "b", 2), "a") == 1
 
 test_state_put_right_wins := assert mw.state_get(
-  mw.state_put(ctx_of(mkreq("GET", "/")), "k", "new"), "k") = "new"
+  mw.state_put(ctx_of(mkreq("GET", "/")), "k", "new"), "k") == "new"
 
 test_state_get_missing := assert mw.state_get(
-  ctx_of(mkreq("GET", "/")), "nope") = null
+  ctx_of(mkreq("GET", "/")), "nope") == null
 
 -- ---------------------------------------------------------------------
 -- chain / pipeline: ordering, fold direction, normalization
@@ -77,15 +77,15 @@ wrap := (tag) ~> (ctx, next) ~> do {
 }
 
 test_chain_order := assert run([wrap("A"), wrap("B"), mark_h("T")],
-  mkreq("GET", "/")) = { status: 200, body: "A(B(T:T))" }
+  mkreq("GET", "/")) == { status: 200, body: "A(B(T:T))" }
 
 test_chain_single_terminal := assert run([mark_h("only")],
-  mkreq("GET", "/")) = { status: 200, body: "T:only" }
+  mkreq("GET", "/")) == { status: 200, body: "T:only" }
 
 test_chain_end_adapter := assert run([
   mw.end((req) ~> do {
     { status: 200, body: "req:" + req.method } })],
-  mkreq("POST", "/x")) = { status: 200, body: "req:POST" }
+  mkreq("POST", "/x")) == { status: 200, body: "req:POST" }
 
 test_pipeline_returns_pair := assert do {
   p := mw.pipeline([ok_h])(ctx_of(mkreq("GET", "/")))
@@ -97,7 +97,7 @@ test_pipeline_returns_pair := assert do {
 --- a pair carrying its incoming ctx.state.
 test_mw_bare_resp_normalized := assert run([
   (ctx, next) ~> { status: 201, body: "bare" },
-  ok_h], mkreq("GET", "/")) = { status: 201, body: "bare" }
+  ok_h], mkreq("GET", "/")) == { status: 201, body: "bare" }
 
 test_chain_empty_raises := assert match error.try(
   (x) ~> mw.chain([])(mkreq("GET", "/"))) {
@@ -128,7 +128,7 @@ echo_xy := (ctx) ~> do {
 
 test_ctx_merge_right_wins := assert run(
   [put_x("outer"), put_x("inner"), put_y("why"), echo_xy],
-  mkreq("GET", "/")) = { status: 200, body: "inner/why" }
+  mkreq("GET", "/")) == { status: 200, body: "inner/why" }
 
 --- outward state: terminal returns an updated state record.
 set_state_h := (ctx) ~> do {
@@ -270,14 +270,14 @@ test_session_loads := assert run([
   (ctx) ~> do {
     { status: 200,
       body: hash_map.get_or(mw.session_data(ctx), "user", "none") } }],
-  cookie_req("sid1")) = { status: 200, body: "alice" }
+  cookie_req("sid1")) == { status: 200, body: "alice" }
 
 test_session_absent := assert run([
   mw.session(store_hit),
   (ctx) ~> do {
     { status: 200,
       body: if mw.session_data(ctx) == null { "none" } else { "yes" } } }],
-  mkreq("GET", "/")) = { status: 200, body: "none" }
+  mkreq("GET", "/")) == { status: 200, body: "none" }
 
 test_session_store_miss := assert run([
   mw.session(store_hit),
@@ -286,7 +286,7 @@ test_session_store_miss := assert run([
     { status: 200,
       body: if s == null { "none" }
         else { hash_map.get_or(s, "id", "no-id") } } }],
-  cookie_req("unknown")) = { status: 200, body: "unknown" }
+  cookie_req("unknown")) == { status: 200, body: "unknown" }
 
 --- write-back spy: set raises with "k=v" so error.try observes it.
 store_spy := {
@@ -355,7 +355,7 @@ verify_tok := (ctx) ~> do {
 }
 
 test_auth_401 := assert run([mw.auth(verify_tok), boom_h],
-  mkreq("GET", "/secret")) =
+  mkreq("GET", "/secret")) ==
   { status: 401, body: "unauthorized",
     headers: hash_map.set({}, "www-authenticate", "Bearer") }
 
@@ -366,14 +366,14 @@ test_auth_principal := assert run([mw.auth(verify_tok),
   (ctx) ~> do {
     { status: 200,
       body: hash_map.get_or(mw.principal(ctx), "user", "none") } }],
-  auth_req) = { status: 200, body: "u1" }
+  auth_req) == { status: 200, body: "u1" }
 
 test_auth_custom_key_challenge := assert run([
   mw.auth(verify_tok, { key: "who", challenge: "Basic" }),
   (ctx) ~> do {
     { status: 200,
       body: hash_map.get_or(mw.state_get(ctx, "who"), "role", "none") } }],
-  auth_req) = { status: 200, body: "admin" }
+  auth_req) == { status: 200, body: "admin" }
 
 test_auth_bad_verify_raises := assert match error.try(
   (x) ~> mw.auth(42)(mkreq("GET", "/"), next_ok)) {
@@ -395,7 +395,7 @@ post_good := mkreqh("POST", "/form", hash_map.set({},
   "x-csrf-token", "tok"))
 
 test_csrf_rejects := assert run([mw.csrf(csrf_check), boom_h],
-  post_bad) = { status: 403, body: "csrf check failed" }
+  post_bad) == { status: 403, body: "csrf check failed" }
 
 test_csrf_accepts := assert run([mw.csrf(csrf_check), mark_h("T")],
   post_good).body == "T:T"
@@ -420,7 +420,7 @@ test_body_limit_pass := assert run([mw.body_limit(5), mark_h("T")],
   req_body("hello")).body == "T:T"
 
 test_body_limit_reject := assert run([mw.body_limit(4), boom_h],
-  req_body("hello")) = { status: 413, body: "payload too large" }
+  req_body("hello")) == { status: 413, body: "payload too large" }
 
 test_body_limit_empty_ok := assert run([mw.body_limit(0), ok_h],
   mkreq("POST", "/")).status == 200
